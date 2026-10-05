@@ -1,0 +1,5 @@
+# Source data stays local (company data)
+data/
+results.csv
+__pycache__/
+.venv/

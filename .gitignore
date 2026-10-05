@@ -1,5 +1,4 @@
-# Source data stays local (company data)
-data/
-results.csv
+# Source data stays local (company data); pass CSV paths as CLI parameters
+*.csv
 __pycache__/
 .venv/

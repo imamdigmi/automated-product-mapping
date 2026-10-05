@@ -8,6 +8,7 @@ Confidence is the similarity-weighted vote share of the winning code.
 
 import argparse
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -18,18 +19,51 @@ K = 5
 THRESHOLD = 0.6
 
 
-def normalize(name: str) -> str:
-    """Lowercase, drop pack sizes (500gm, 1.5kg), punctuation and 1-char tokens."""
-    s = name.lower()
-    s = re.sub(r"\d+(\.\d+)?\s*(kg|gm|g|ml|l|pcs|pc)?\b", " ", s)
-    s = re.sub(r"[^a-z ]", " ", s)
-    return " ".join(w for w in s.split() if len(w) > 1)
+# Words that carry no product meaning: origins, packaging, marketing, size, cut, colour.
+NOISE = set("""
+organic org bio eco premium fresh farm farms farmfresh local import imp imported
+pp pkt pck pak pack packet packed pre tray box bag bulk loose punnet pot bunch clamshell
+per approx appx apx kg g gm gms gr grm k pc pcs x s w a by with air ec pa ag sf r of and the
+small medium large big jumbo mini
+whole peeled sliced chopped cut cutting diced cleaned washed iced cube shredded seedless sleeve
+red yellow white black golden gold pink brown purple
+qatar qat doha lebanon lebnon leb usa us india iran holland holnd jordan spain thailand thai egypt
+australia aus morocco moroccan oman south africa ksa saudi arabia china chinese syria pakistan kenya
+italy philippines vietnam chile uganda tunisia peru europe mexico azerbaijan bangladesh yemen yeman
+uae sudan greek greece france netherlands new zealand nz argentina sri lanka srilanka
+ethiopia colombia ecuador japan korea indonesia malaysia germany belgium cyprus portugal poland
+""".split())
+SYNONYMS = {"dry": "dried", "frz": "frozen", "frzn": "frozen"}
+
+
+def singular(word: str) -> str:
+    """Crude plural stripping so 'cherries' matches 'cherry' and 'plums' matches 'plum'."""
+    if len(word) <= 3 or word.endswith(("ss", "us")):
+        return word
+    if word.endswith("ies"):
+        return word[:-3] + "y"
+    if word.endswith("oes"):
+        return word[:-2]
+    return word[:-1] if word.endswith("s") else word
+
+
+def normalize(name: str, drop_noise: bool = True) -> str:
+    """Lowercase, drop pack sizes and noise words, singularize, map state synonyms."""
+    s = re.sub(r"\d+(\.\d+)?\s*(kgs?|gms?|grm?s?|g|ml|l|pcs|pc|k)?\b", " ", name.lower())
+    words = [SYNONYMS.get(singular(w), singular(w)) for w in re.sub(r"[^a-z ]", " ", s).split() if len(w) > 1]
+    if drop_noise:
+        # Keep the original words if everything was noise
+        words = [w for w in words if w not in NOISE] or words
+    return " ".join(words)
 
 
 def catalog_entries(catalog: pd.DataFrame) -> tuple[list[str], list[str]]:
-    """One searchable text per catalog code, e.g. 'jarjeer fresh jarjeer roca rocca rocket'."""
-    text = catalog.product_en + " " + catalog.state_en + " " + catalog.remarks.fillna("")
-    return [normalize(t) for t in text], list(catalog.product_code)
+    """One searchable text per catalog code, e.g. 'jarjeer jarjeer roca rocca rocket'."""
+    # "Fresh" is the default state, so only non-fresh states (Frozen, Dried, ...) are added
+    state = catalog.state_en.where(catalog.state_en != "Fresh", "")
+    text = catalog.product_en + " " + state + " " + catalog.remarks.fillna("")
+    # Catalog names are clean; noise removal would break e.g. "Turkey meat", "Black tea"
+    return [normalize(t, drop_noise=False) for t in text], list(catalog.product_code)
 
 
 class Mapper:
@@ -57,7 +91,7 @@ class Mapper:
 
 def to_result(src: pd.DataFrame, codes, scores, catalog: pd.DataFrame) -> pd.DataFrame:
     names = catalog.set_index("product_code").pipe(lambda c: c.product_en + " - " + c.state_en)
-    out = src[["src_product_code", "src_product_name_en"]].copy()
+    out = src[[c for c in ["source", "src_product_code", "src_product_name_en"] if c in src]].copy()
     out["suggested_code"] = codes
     out["suggested_name"] = out.suggested_code.map(names)
     out["confidence"] = np.round(scores, 3)
@@ -78,33 +112,42 @@ def validate(mapping: pd.DataFrame, catalog: pd.DataFrame, folds: int) -> pd.Dat
     out["actual_code"] = mapping.product_code
     out["is_correct"] = out.suggested_code == out.actual_code
 
-    auto = out[out.status == "AUTO"]
-    print(f"Rows                 : {len(out)}")
-    print(f"Top-1 accuracy (all) : {out.is_correct.mean():.1%}")
-    print(f"AUTO (conf > {THRESHOLD})   : {len(auto)} ({len(auto) / len(out):.1%})  precision {auto.is_correct.mean():.1%}")
-    print(f"REVIEW               : {len(out) - len(auto)} ({1 - len(auto) / len(out):.1%})")
+    auto = out.status == "AUTO"
+    summary = pd.DataFrame({
+        "rows": out.groupby("source").size(),
+        "accuracy": out.groupby("source").is_correct.mean(),
+        "auto_share": auto.groupby(out.source).mean(),
+        "auto_precision": out[auto].groupby("source").is_correct.mean(),
+    })
+    summary.loc["ALL"] = [len(out), out.is_correct.mean(), auto.mean(), out[auto].is_correct.mean()]
+    print(f"AUTO = confidence > {THRESHOLD}")
+    print(summary.to_string(formatters={"rows": "{:.0f}".format, **{c: "{:.1%}".format for c in summary.columns[1:]}}))
     return out
+
+
+def read_csv(path: str) -> pd.DataFrame:
+    return pd.read_csv(path, dtype=str, encoding="utf-8-sig")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["validate", "predict"])
-    parser.add_argument("--mapping", default="data/product_mapping_ext_lulu.csv", help="labelled past mappings")
-    parser.add_argument("--catalog", default="data/product.csv", help="target product catalog")
+    parser.add_argument("--mapping", nargs="+", required=True, help="one or more labelled mapping CSVs")
+    parser.add_argument("--catalog", required=True, help="target product catalog CSV (product.csv)")
     parser.add_argument("--input", help="predict: CSV with src_product_code, src_product_name_en")
     parser.add_argument("--out", default="results.csv")
     parser.add_argument("--folds", type=int, default=5)
     args = parser.parse_args()
 
-    mapping = pd.read_csv(args.mapping, dtype=str)
-    catalog = pd.read_csv(args.catalog, dtype=str, encoding="utf-8-sig")
+    mapping = pd.concat([read_csv(p).assign(source=Path(p).stem) for p in args.mapping], ignore_index=True)
+    catalog = read_csv(args.catalog)
 
     if args.command == "validate":
         out = validate(mapping, catalog, args.folds)
     else:
         if not args.input:
             parser.error("predict requires --input")
-        new = pd.read_csv(args.input, dtype=str)
+        new = read_csv(args.input)
         model = Mapper().fit(mapping.src_product_name_en, mapping.product_code, catalog)
         out = to_result(new, *model.predict(new.src_product_name_en), catalog)
         print(out.status.value_counts().to_string())

@@ -77,6 +77,76 @@ def normalize_ar(name: str) -> str:
     return " ".join(re.sub(r"[^ء-ي ]", " ", s).split())
 
 
+# --- Size extraction ----------------------------------------------------------
+# Canonical unit -> spellings seen in retailer names (longest first inside each regex)
+UNITS = {
+    "kg": r"kgs|kg|kilos?|k",
+    "g": r"grams?|grms?|grm|gms|gm|gr|g",
+    "ml": r"ml",
+    "l": r"ltrs?|litres?|liters?|l",
+    "oz": r"oz",
+    "lb": r"lbs?",
+    "pint": r"pints?",
+    "pcs": r"pieces?|pcs|pcc|pc|pkts?|packets?|packs?|pk|cobs?",
+}
+MEASURE = "|".join(UNITS[u] for u in ["kg", "g", "ml", "l", "oz", "lb", "pint"])
+# A number not part of a range or grade (14-16, 50/70, 50 /70); '.5' is a decimal
+# only when the dot does not end an abbreviation ("Appx.500gm")
+NUM = r"(?<!\d)(?<!\d[.\-/])(?<!\d\s[-/])(\d+(?:\.\d+)?|(?<![\w.])\.\d+)"
+# Unit must end the word; retailer tags ("400gPO", "250GC", "250GW") or "x5" may follow
+END = r"(?:po|pd|[cew])?(?:(?![a-z])|(?=x\s*\d))"
+MULTIPACK = re.compile(rf"(?<![\d.\-/])(\d+)\s*[x*]\s*{NUM}\s*({MEASURE}|{UNITS['pcs']})?{END}", re.I)
+MEASURE_RE = re.compile(rf"{NUM}\s*({MEASURE}){END}(?:\s*[x*]\s*(\d+)(?![\d.]))?", re.I)
+COUNT_RE = re.compile(rf"{NUM}\s*({UNITS['pcs']}){END}", re.I)
+# "x2" alone = 2 pieces
+TIMES_RE = re.compile(r"(?<![\w.])[x*]\s*(\d+)(?![\d.]|\s*[a-z]*\d)", re.I)
+# "3s" / "2's": after a weight = number of packs; alone = pieces. Without an apostrophe
+# only below 20, because "70S" / "48S" are carton count grades, not pack sizes.
+PACKS_RE = re.compile(r"(?<![\w.\-/])(\d+)\s*('?)s(?:po)?(?![a-z])", re.I)
+MAX_PIECES = 100
+
+
+def canonical_unit(unit: str) -> str:
+    return next(u for u, pattern in UNITS.items() if re.fullmatch(pattern, unit, re.I))
+
+
+def extract_size(name: str) -> tuple[float | None, str | None, float | None]:
+    """(size_value, size_unit, size_multiplier) parsed from a product name; None when absent.
+
+    "Okra 400g 3s" -> (400.0, "g", 3.0); "2x400gPO" -> (400.0, "g", 2.0); "Avocado 2PCS" -> (2.0, "pcs", None).
+    Numbers that are not sizes (6mm, 14-16, 50/70, R2E2, 4 COLOR, 100%, GRADE 1) are ignored.
+    """
+    name = str(name)
+    multi = MULTIPACK.search(name)
+    unit = canonical_unit(multi.group(3)) if multi and multi.group(3) else None
+    if unit and unit != "pcs":
+        return float(multi.group(2)), unit, float(multi.group(1))
+
+    measure = MEASURE_RE.search(name)
+    if measure:
+        # Packs count only after the weight ("400g 3s"); before it they are pieces inside ("Cob 4s 950g")
+        packs = PACKS_RE.search(name, measure.end())
+        times = measure.group(3) or (packs.group(1) if packs else None)
+        return float(measure.group(1)), canonical_unit(measure.group(2)), float(times) if times else None
+
+    # Unitless "4X250" is ambiguous (grams? pieces?); only "1X6" reads as 6 pieces
+    if multi and (unit == "pcs" or multi.group(1) == "1"):
+        return float(multi.group(2)), "pcs", float(multi.group(1))
+    count = COUNT_RE.search(name)
+    packs = PACKS_RE.search(name)
+    times = TIMES_RE.search(name)
+    if count:
+        value = float(count.group(1))
+    elif packs and (packs.group(2) or int(packs.group(1)) < 20):
+        value = float(packs.group(1))
+    elif times:
+        value = float(times.group(1))
+    else:
+        return None, None, None
+    # "500 PACK" is a 500 g pack, not 500 pieces
+    return (value, "pcs", None) if value <= MAX_PIECES else (None, None, None)
+
+
 def catalog_entries(catalog: pd.DataFrame) -> tuple[list[str], list[str]]:
     """One searchable text per catalog code, e.g. 'jarjeer jarjeer roca rocca rocket'."""
     # "Fresh" is the default state, so only non-fresh states (Frozen, Dried, ...) are added
@@ -181,6 +251,9 @@ def to_result(src: pd.DataFrame, pred: pd.DataFrame, catalog: pd.DataFrame) -> p
     out["similarity"] = pred.similarity.round(3)
     out["arabic_check"] = pred.arabic_check
     out["arabic_suggestion"] = pred.arabic_code.map(names).where(pred.arabic_check == "disagree", "")
+    sizes = pd.DataFrame([extract_size(n) for n in out.src_product_name_en], columns=["value", "unit", "multiplier"])
+    out["size_value"], out["size_unit"] = sizes.value, sizes.unit
+    out.insert(out.columns.get_loc("size_unit") + 1, "size_multiplier", sizes.multiplier)
     return out
 
 

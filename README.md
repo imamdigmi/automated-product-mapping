@@ -1,54 +1,61 @@
 # Automated Product Mapping
 
-Maps short retail product names (`src_product_name_en`, 1–8 words) from retailer mapping files
-(e.g. `product_mapping_ext_lulu.csv`) to `product_code` in `product.csv`.
-A code is returned only when confidence > 0.6; otherwise the row is flagged `REVIEW`.
+Maps short retail product names (`src_product_name_en`) to Hassad `product_code` (`product.csv`),
+learning from retailers' past mappings. Every row gets a `product_code`; rows the model is not sure
+about are marked `REVIEW` with the reason.
 
-```
- past mappings (1..n retailer CSVs) ─┐
-                                     ├─► char n-gram TF-IDF index
- catalog (product.csv)  ─────────────┘
-
- src_product_name_en ─► normalize ─► top-5 nearest ─► similarity-weighted vote
-   (drop sizes, origins,                                 │
-    packaging, colours;          score > 0.6 ? ──────────┼── yes ─► AUTO   (mapped_code)
-    plural → singular)                                   └── no  ─► REVIEW (suggestion only)
-```
-
-## Setup
+## Quick start
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-```
 
-CSV files are never committed; pass their paths as parameters.
-
-## Usage
-
-```bash
-# Validate: 5-fold out-of-fold predictions on the labelled files + per-file accuracy summary
-python map_products.py validate \
-  --mapping product_mapping_ext_lulu.csv product_mapping_ext_megamart.csv product_mapping_ext_meera.csv \
-  --catalog product.csv --out results.csv
-
-# Predict new items (CSV with src_product_code, src_product_name_en)
+# Map new products (one or more input CSVs -> one output CSV)
 python map_products.py predict \
   --mapping product_mapping_ext_lulu.csv product_mapping_ext_megamart.csv product_mapping_ext_meera.csv \
-  --catalog product.csv --input new_items.csv --out results.csv
+  --catalog product.csv \
+  --input   lulu_unmapped.csv meera_unmapped.csv \
+  --out     results.csv
+
+# Optional: measure accuracy on the labelled files (5-fold cross-validation)
+python map_products.py validate \
+  --mapping product_mapping_ext_lulu.csv product_mapping_ext_megamart.csv product_mapping_ext_meera.csv \
+  --catalog product.csv --out validation.csv
 ```
 
-Output columns: `source`, `suggested_code`, `suggested_name`, `confidence`, `status` (AUTO/REVIEW),
-`mapped_code` (filled only for AUTO). `validate` also adds `actual_code`, `is_correct`.
+Inputs need `src_product_name_en`; `src_product_name_ar` is optional (enables the Arabic check).
+CSV files are never committed; always pass their paths.
 
-## Current validation (5-fold CV, all three retailers pooled)
+## Reading the output
 
-| File | Rows | Accuracy | AUTO share | AUTO precision |
-|---|---|---|---|---|
-| lulu | 632 | 87.8% | 87.0% | 94.7% |
-| megamart | 1,691 | 93.5% | 92.5% | 97.1% |
-| meera | 1,863 | 92.5% | 91.7% | 96.7% |
-| **All** | **4,186** | **92.2%** | **91.3%** | **96.5%** |
+The output keeps all input columns and fills `product_code` and `remarks`, plus:
 
-Most remaining AUTO errors are label conflicts between retailers (e.g. plums labelled Peach,
-kale as Other brassicas vs Other Leafy Greens), not model errors.
+| Column | Meaning |
+|---|---|
+| `source` | Input file the row came from |
+| `status` | `AUTO` = accept as is · `REVIEW` = a person should confirm `product_code` |
+| `note` | Why: `exact match`, `state from name`, `low confidence`, `low similarity`, `name is not fresh` |
+| `confidence` / `similarity` | Vote share of the top-5 matches / closeness of the best match (0–1) |
+| `arabic_check` | Arabic name matched separately: `agree`, `disagree`, `weak match`, `no arabic name` |
+| `arabic_suggestion` | The Arabic match's product when it disagrees |
+
+Suggested workflow: work through `REVIEW` rows, then spot-check `AUTO` rows with
+`arabic_check = disagree`. Add confirmed rows back to the mapping files so the model learns them.
+
+## How it works
+
+```
+ past mappings (1..n CSVs) ─┐
+                            ├─► char n-gram TF-IDF index ─► top-5 nearest ─► weighted vote
+ product.csv catalog ───────┘
+                                     exact name seen before? ─► reuse its code
+ AUTO only if: confidence > 0.6 AND similarity ≥ 0.5 AND name is not frozen/dried/processed
+               while the prediction is Fresh (a "frozen"/"dried" name switches to the matching code)
+```
+
+## Current results
+
+| Data | AUTO share | AUTO precision |
+|---|---|---|
+| Labelled files, 5-fold CV (4,186 rows) | 89.8% | 97.4% (measured) |
+| New unmapped files (6,362 rows, 4 retailers) | 72.9% | ~91% (hand-checked sample of 198) |
